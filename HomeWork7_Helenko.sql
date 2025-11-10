@@ -1,0 +1,212 @@
+﻿
+USE DDL;
+
+IF OBJECT_ID (N'dbo.SALES_DATA', 'U') IS NOT NULL
+   DROP TABLE dbo.SALES_DATA
+
+CREATE TABLE dbo.SALES_DATA (
+    ORDER_ID          INT             IDENTITY (1,1),
+    ORDER_DATE        DATETIME        DEFAULT SYSDATETIME(),
+    LEGAL_ENTITY_CODE INT,            -- Планується збереження виключно кодів ЄДРПОУ
+    CUSTOMER_NAME     NVARCHAR(100),
+    CUSTOMER_E_MAILS  NVARCHAR(100),
+    PRODUCT_NAMES     NVARCHAR(1000),
+    TOTAL_SUM         DECIMAL(19,2)   CHECK (TOTAL_SUM >= 0)
+);
+
+INSERT INTO dbo.SALES_DATA (LEGAL_ENTITY_CODE, CUSTOMER_NAME, CUSTOMER_E_MAILS, PRODUCT_NAMES, TOTAL_SUM) 
+     VALUES (40334690,'ТОВ "Глобал Трейд Україна"', 'gt@ukr.net, global.trade@gmail.com', 'Товар103, Товар210, Товар 352',  132451.00);
+
+INSERT INTO dbo.SALES_DATA (LEGAL_ENTITY_CODE, CUSTOMER_NAME, CUSTOMER_E_MAILS, PRODUCT_NAMES, TOTAL_SUM) 
+     VALUES (40375384,'Агро Ленд', 'al@ukr.net', 'Товар117',  39597.00);
+
+INSERT INTO dbo.SALES_DATA (LEGAL_ENTITY_CODE, CUSTOMER_NAME, PRODUCT_NAMES, TOTAL_SUM) 
+     VALUES (56973459,'Товариство з обмеженою відповідальністю "ТехноМаркет Плюс"', 'Товар23, Товар41',  289452.00);
+
+
+SELECT *
+  FROM [dbo].[SALES_DATA];
+
+              
+
+USE DDL;
+
+DROP TABLE IF EXISTS dbo.DATATYPES;
+DROP TABLE IF EXISTS dbo.EMPLOYEES;
+DROP TABLE IF EXISTS SALES.DATATYPES;
+
+
+
+USE DDL;
+GO
+
+/* =========================
+   1) 1NF — атомарні значення
+   ========================= */
+
+IF OBJECT_ID('dbo.SALES_DATA_1NF','U') IS NOT NULL DROP TABLE dbo.SALES_DATA_1NF;
+-- створимо через SELECT INTO з першою порцією (де email є)
+SELECT
+    s.ORDER_ID,
+    s.ORDER_DATE,
+    s.LEGAL_ENTITY_CODE             AS CUSTOMER_ID,
+    s.CUSTOMER_NAME,
+    LTRIM(RTRIM(e.value))           AS CUSTOMER_EMAIL,   -- 1 email в рядку
+    LTRIM(RTRIM(p.value))           AS PRODUCT_NAME,     -- 1 товар в рядку
+    s.TOTAL_SUM                     AS ORDER_TOTAL_SUM
+INTO dbo.SALES_DATA_1NF
+FROM dbo.SALES_DATA s
+CROSS APPLY STRING_SPLIT(s.PRODUCT_NAMES, ',') p
+CROSS APPLY STRING_SPLIT(COALESCE(s.CUSTOMER_E_MAILS, N''), ',') e
+WHERE LTRIM(RTRIM(COALESCE(s.CUSTOMER_E_MAILS, N''))) <> N'';
+
+-- додаємо рядки для замовлень БЕЗ email (email = NULL)
+INSERT INTO dbo.SALES_DATA_1NF(
+    ORDER_DATE, CUSTOMER_ID, CUSTOMER_NAME, CUSTOMER_EMAIL, PRODUCT_NAME, ORDER_TOTAL_SUM
+)
+SELECT
+    s.ORDER_DATE,
+    s.LEGAL_ENTITY_CODE,
+    s.CUSTOMER_NAME,
+    NULL AS CUSTOMER_EMAIL,
+    LTRIM(RTRIM(p.value)) AS PRODUCT_NAME,
+    s.TOTAL_SUM
+FROM dbo.SALES_DATA s
+CROSS APPLY STRING_SPLIT(s.PRODUCT_NAMES, ',') p
+WHERE LTRIM(RTRIM(COALESCE(s.CUSTOMER_E_MAILS, N''))) = N'';
+
+
+/* =========================
+   2) 2NF — окремі сутності
+   (мінімум ID: CUSTOMER/ORDER/PRODUCT)
+   ========================= */
+
+-- Чистимо, якщо є
+IF OBJECT_ID('dbo.CustomerEmails','U') IS NOT NULL DROP TABLE dbo.CustomerEmails;
+IF OBJECT_ID('dbo.OrderItems','U')   IS NOT NULL DROP TABLE dbo.OrderItems;
+IF OBJECT_ID('dbo.Orders','U')       IS NOT NULL DROP TABLE dbo.Orders;
+IF OBJECT_ID('dbo.Products','U')     IS NOT NULL DROP TABLE dbo.Products;
+IF OBJECT_ID('dbo.Customers','U')    IS NOT NULL DROP TABLE dbo.Customers;
+
+-- Customers (CUSTOMER_ID = LEGAL_ENTITY_CODE)
+CREATE TABLE dbo.Customers(
+    CUSTOMER_ID   INT PRIMARY KEY,           -- = LEGAL_ENTITY_CODE
+    CUSTOMER_NAME NVARCHAR(200) NOT NULL
+);
+INSERT INTO dbo.Customers(CUSTOMER_ID, CUSTOMER_NAME)
+SELECT DISTINCT CUSTOMER_ID, CUSTOMER_NAME
+FROM dbo.SALES_DATA_1NF;
+
+-- CustomerEmails (1..N, композитний ключ)
+CREATE TABLE dbo.CustomerEmails(
+    CUSTOMER_ID INT NOT NULL,
+    EMAIL       NVARCHAR(200) NOT NULL,
+    CONSTRAINT PK_CustomerEmails PRIMARY KEY (CUSTOMER_ID, EMAIL),
+    CONSTRAINT FK_CustomerEmails_Customers FOREIGN KEY (CUSTOMER_ID)
+        REFERENCES dbo.Customers(CUSTOMER_ID)
+);
+INSERT INTO dbo.CustomerEmails(CUSTOMER_ID, EMAIL)
+SELECT DISTINCT CUSTOMER_ID, CUSTOMER_EMAIL
+FROM dbo.SALES_DATA_1NF
+WHERE CUSTOMER_EMAIL IS NOT NULL;
+
+-- Products (довідник)
+CREATE TABLE dbo.Products(
+    PRODUCT_ID   INT IDENTITY(1,1) PRIMARY KEY,
+    PRODUCT_NAME NVARCHAR(200) NOT NULL UNIQUE
+);
+INSERT INTO dbo.Products(PRODUCT_NAME)
+SELECT DISTINCT PRODUCT_NAME
+FROM dbo.SALES_DATA_1NF;
+
+-- Orders (2NF: З TOTAL_SUM)
+IF OBJECT_ID('dbo.OrderItems','U') IS NOT NULL DROP TABLE dbo.OrderItems;
+IF OBJECT_ID('dbo.Orders','U') IS NOT NULL DROP TABLE dbo.Orders;
+GO
+
+CREATE TABLE dbo.Orders(
+    ORDER_ID    INT PRIMARY KEY,
+    ORDER_DATE  NVARCHAR(20) NOT NULL,  -- або DATETIME2
+    CUSTOMER_ID INT NOT NULL,
+    TOTAL_SUM   DECIMAL(18,2) NULL,
+    CONSTRAINT FK_Orders_Customers FOREIGN KEY (CUSTOMER_ID)
+        REFERENCES dbo.Customers(CUSTOMER_ID)
+);
+GO
+
+INSERT INTO dbo.Orders(ORDER_ID, ORDER_DATE, CUSTOMER_ID, TOTAL_SUM)
+SELECT DISTINCT
+       ORDER_ID,
+       ORDER_DATE,
+       CUSTOMER_ID,
+       ORDER_TOTAL_SUM             -- беремо з 1NF
+FROM dbo.SALES_DATA_1NF;
+
+-- OrderItems (зв’язок Orders–Products; композитний PK)
+CREATE TABLE dbo.OrderItems(
+    ORDER_ID   INT NOT NULL,
+    PRODUCT_ID INT NOT NULL,
+    Quantity   INT NOT NULL DEFAULT(1),
+    -- У 2NF тримаємо тільки те, що залежить від усього ключа (ORDER_ID, PRODUCT_ID)
+    CONSTRAINT PK_OrderItems PRIMARY KEY (ORDER_ID, PRODUCT_ID),
+    CONSTRAINT FK_OrderItems_Orders   FOREIGN KEY (ORDER_ID)   REFERENCES dbo.Orders(ORDER_ID),
+    CONSTRAINT FK_OrderItems_Products FOREIGN KEY (PRODUCT_ID) REFERENCES dbo.Products(PRODUCT_ID)
+);
+INSERT INTO dbo.OrderItems(ORDER_ID, PRODUCT_ID, Quantity)
+SELECT DISTINCT
+    s.ORDER_ID,
+    p.PRODUCT_ID,
+    1
+FROM dbo.SALES_DATA_1NF s
+JOIN dbo.Products p ON p.PRODUCT_NAME = s.PRODUCT_NAME;
+
+SELECT * FROM dbo.Customers ORDER BY CUSTOMER_ID;
+SELECT * FROM dbo.CustomerEmails ORDER BY CUSTOMER_ID, EMAIL;
+SELECT * FROM dbo.Products ORDER BY PRODUCT_ID;
+SELECT * FROM dbo.Orders ORDER BY ORDER_ID;
+SELECT * FROM dbo.OrderItems ORDER BY ORDER_ID, PRODUCT_ID;
+
+
+--3) 3NF 
+
+ALTER TABLE dbo.Orders DROP COLUMN TOTAL_SUM;
+
+ALTER TABLE dbo.OrderItems 
+    ADD UnitPrice DECIMAL(18,2) NULL;  -- якщо ще нема
+GO   
+
+CREATE OR ALTER VIEW dbo.v_OrderTotals AS
+SELECT o.ORDER_ID,
+       SUM(oi.Quantity * ISNULL(oi.UnitPrice,0)) AS ORDER_TOTAL
+FROM dbo.Orders o
+JOIN dbo.OrderItems oi ON oi.ORDER_ID = o.ORDER_ID
+GROUP BY o.ORDER_ID;
+GO
+
+-- CUSTOMERS
+SELECT CUSTOMER_ID, CUSTOMER_NAME
+FROM dbo.Customers
+ORDER BY CUSTOMER_ID;
+
+-- CUSTOMERS EMAILS
+SELECT CUSTOMER_ID, EMAIL
+FROM dbo.CustomerEmails
+ORDER BY CUSTOMER_ID, EMAIL;
+
+-- PRODUCTS
+SELECT PRODUCT_ID, PRODUCT_NAME
+FROM dbo.Products
+ORDER BY PRODUCT_ID;
+
+-- ORDERS (3NF: без TOTAL_SUM)
+SELECT ORDER_ID, ORDER_DATE, CUSTOMER_ID
+FROM dbo.Orders
+ORDER BY ORDER_ID;
+
+-- ORDER ITEMS (з Quantity та UnitPrice)
+SELECT ORDER_ID, PRODUCT_ID, Quantity, UnitPrice
+FROM dbo.OrderItems
+ORDER BY ORDER_ID, PRODUCT_ID;
+
+-- ПІДСУМКИ 3NF (мають збігтися зі старими TOTAL з 2NF)
+SELECT * FROM dbo.v_OrderTotals ORDER BY ORDER_ID;
